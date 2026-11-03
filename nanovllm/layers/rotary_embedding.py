@@ -1,6 +1,7 @@
 from functools import lru_cache
 import torch
 from torch import nn
+from nanovllm.utils.compile import compile_if_supported
 
 
 def apply_rotary_emb(
@@ -26,15 +27,26 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.head_size = head_size
         assert rotary_dim == head_size
-        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
-        t = torch.arange(max_position_embeddings, dtype=torch.float)
+        self.rotary_dim = rotary_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.register_buffer("cos_sin_cache", self._build_cache(torch.get_default_device()), persistent=False)
+
+    def _build_cache(self, device):
+        inv_freq = 1.0 / (self.base**(torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device=device) / self.rotary_dim))
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float, device=device)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
         sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
-        self.register_buffer("cos_sin_cache", cache, persistent=False)
+        return torch.cat((cos, sin), dim=-1).unsqueeze_(1)
 
-    @torch.compile
+    def rebuild_cache(self, device):
+        # CPU model construction must not change the arithmetic used to create
+        # execution-time RoPE tables. A CPU-computed trig table merely moved to
+        # CUDA can differ from the GPU-created baseline and amplify INT8 rounds.
+        self.cos_sin_cache = self._build_cache(device)
+
+    @compile_if_supported
     def forward(
         self,
         positions: torch.Tensor,

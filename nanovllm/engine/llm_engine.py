@@ -4,6 +4,7 @@ from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
+import torch
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
@@ -18,6 +19,9 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
+        if config.tensor_parallel_size > torch.cuda.device_count():
+            raise ValueError(f"tensor_parallel_size={config.tensor_parallel_size} requires that many GPUs; found {torch.cuda.device_count()}")
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -32,9 +36,14 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.model_runner.bind_block_manager(self.scheduler.block_manager)
+        self.request_metrics = {}
+        self.last_step_metrics = {}
         atexit.register(self.exit)
 
     def exit(self):
+        if not hasattr(self, "model_runner"):
+            return
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -43,19 +52,50 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        if not prompt or sampling_params.max_tokens < 1:
+            raise ValueError("Requests need a nonempty prompt and positive max_tokens")
+        if len(prompt) + sampling_params.max_tokens > self.config.max_model_len:
+            raise ValueError("prompt length + max_tokens exceeds max_model_len")
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        if not hasattr(self, "request_metrics"):
+            self.request_metrics = {}
+        self.request_metrics[seq.seq_id] = dict(submitted=perf_counter(), token_times=[])
+        return seq
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        prefill_tokens = sum(seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
+        decode_tokens = sum(not seq.is_prefill for seq in seqs)
+        self.last_step_metrics = dict(prefill_tokens=prefill_tokens, decode_tokens=decode_tokens,
+                                      mixed=bool(prefill_tokens and decode_tokens))
+        num_tokens = prefill_tokens if is_prefill else -len(seqs)
+        before = [seq.num_completion_tokens for seq in seqs]
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        # Observed at step completion, not a client/network streaming timestamp.
+        now = perf_counter()
+        for seq, count in zip(seqs, before):
+            metric = self.request_metrics.get(seq.seq_id)
+            if metric is not None and seq.num_completion_tokens > count:
+                metric["token_times"].append(now)
+                if seq.is_finished:
+                    metric["finished"] = now
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
     def is_finished(self):
         return self.scheduler.is_finished()
+
+    def get_request_metrics(self, seq_id):
+        """Step-completion timestamps, not client/network latency measurements."""
+        record = self.request_metrics[seq_id]
+        times = record["token_times"]
+        return dict(output_tokens=len(times),
+                    ttft_seconds=times[0] - record["submitted"] if times else None,
+                    tpot_seconds=(times[-1] - times[0]) / (len(times) - 1) if len(times) > 1 else None,
+                    latency_seconds=record["finished"] - record["submitted"] if "finished" in record else None,
+                    timestamp_scope="engine_step_completion")
 
     def generate(
         self,

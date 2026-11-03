@@ -169,6 +169,7 @@ class Qwen3Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.weight_offload_manager = None
 
     def forward(
         self,
@@ -177,8 +178,17 @@ class Qwen3Model(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, residual)
+        manager = self.weight_offload_manager
+        if manager is not None:
+            manager.begin_forward()
+        try:
+            for i, layer in enumerate(self.layers):
+                if manager is not None:
+                    layer = manager.prepare_layer(i)
+                hidden_states, residual = layer(positions, hidden_states, residual)
+        finally:
+            if manager is not None:
+                manager.end_forward()
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 

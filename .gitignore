@@ -193,3 +193,23 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Regenerable full-logit evaluation tensors; JSON evidence remains reviewable.
+results/**/*.pt
+results/int8-reference.pt
+
+# Local study notes, interview preparation and experiment reports.
+/INTERVIEW_QA*.md
+/ORIGINAL_PROJECT_INTERVIEW*.md
+/RESUME_INTERVIEW_QUESTIONS.md
+/LEARNING_NOTES.md
+/OFFLOAD_*.md
+/KV_CACHE_*.md
+/INT8_KV_RESULTS.md
+/REPRODUCTION.md
+
+# Local experiment artifacts, exercises and editor workspaces.
+/results/
+/手撕flashattention.py
+/scripts/profile_learning.py
+/*.code-workspace
